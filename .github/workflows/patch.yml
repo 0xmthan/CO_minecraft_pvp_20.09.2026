@@ -1,0 +1,469 @@
+name: Check & Build & Release
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Force upstream tag (e.g. 10.0.5). Leave empty to auto-detect."
+        required: false
+      force_rebuild:
+        description: "Force build even if a release for this tag already exists. Useful after patch-only fixes."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Detect whether a new upstream version exists
+  # ─────────────────────────────────────────────
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      skip: ${{ steps.check.outputs.skip }}
+
+    steps:
+      - name: Get latest upstream tag
+        id: upstream
+        run: |
+          if [ -n "${{ github.event.inputs.force_version }}" ]; then
+            TAG="${{ github.event.inputs.force_version }}"
+          else
+            TAG=$(curl -sf "https://api.github.com/repos/PrismLauncher/PrismLauncher/releases/latest" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              | jq -r '.tag_name')
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $TAG"
+
+      - name: Check if already released
+        id: check
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          FORCE_REBUILD="${{ github.event.inputs.force_rebuild }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}")
+
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Force rebuild requested for $TAG, proceeding even if release already exists."
+          elif [ "$STATUS" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists, skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New version $TAG, proceeding with build."
+          fi
+
+  # ─────────────────────────────────────────────
+  # 2. Build patched binaries (macOS + Windows)
+  # ─────────────────────────────────────────────
+  build:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            artifact-name: macOS
+            cmake-preset: macos_universal
+            macosx-deployment-target: "12.0"
+            qt-version: "6.9.3"
+
+          - os: windows-2022
+            artifact-name: Windows-MSVC
+            cmake-preset: windows_msvc
+            vcvars-arch: amd64
+            qt-version: "6.10.2"
+
+          - os: ubuntu-24.04
+            artifact-name: Linux
+            cmake-preset: linux
+            qt-version: "6.10.2"
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      BUILD_DIR: build
+      INSTALL_DIR: install
+      BUILD_TYPE: Release
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx-deployment-target }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+        with:
+          path: patcher
+
+      - name: Clone Prism Launcher at upstream tag
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch "$TAG" \
+            https://github.com/PrismLauncher/PrismLauncher.git prism-src
+          echo "Cloned @ $TAG"
+
+      - name: Apply offline patches
+        run: |
+          cd prism-src
+          git apply --whitespace=nowarn ../patcher/patches/0001-ownsMinecraft-always-true.patch
+          git apply --whitespace=nowarn ../patcher/patches/0002-anyAccountIsValid-always-true.patch
+          git apply --whitespace=nowarn ../patcher/patches/0003-decideLaunchMode-skip-auth.patch
+          git apply --whitespace=nowarn ../patcher/patches/0004-download-missing-libraries-offline.patch
+          echo "All patches applied."
+
+
+      # ── Linux deps ──────────────────────────────
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install \
+            dpkg-dev \
+            ninja-build extra-cmake-modules pkg-config scdoc \
+            cmark gamemode-dev libarchive-dev libcmark-dev libqrencode-dev zlib1g-dev \
+            libxcb-cursor-dev libtomlplusplus-dev
+
+      - name: Setup AppImage tooling (Linux)
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine AppImage architecture to use
+          dpkg_arch="$(dpkg-architecture -q DEB_HOST_ARCH_CPU)"
+          case "$dpkg_arch" in
+            "amd64")
+              APPIMAGE_ARCH="x86_64"
+              ;;
+            "arm64")
+              APPIMAGE_ARCH="aarch64"
+              ;;
+            *)
+              echo "# 🚨 The Debian architecture \"$dpkg_arch\" is not recognized!" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+          mkdir -p ~/bin
+          gh release download \
+            --repo VHSgunzo/sharun \
+            --pattern "sharun-$APPIMAGE_ARCH-aio" \
+            --output ~/bin/sharun
+
+          gh release download continuous \
+            --repo DioEgizio/go-appimage \
+            --pattern "mkappimage-*-$APPIMAGE_ARCH.AppImage" \
+            --output ~/bin/mkappimage
+
+          gh release download \
+            --repo AppImageCommunity/AppImageUpdate \
+            --pattern "AppImageUpdate-$APPIMAGE_ARCH.AppImage" \
+            --output ~/bin/AppImageUpdate.AppImage
+          
+          chmod +x ~/bin/*
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Qt (Linux)
+        if: runner.os == 'Linux'
+        uses: jurplel/install-qt-action@v4
+        with:
+          aqtversion: "==3.1.*"
+          version: ${{ matrix.qt-version }}
+          modules: qtimageformats qtnetworkauth
+          cache: false
+
+      # ── macOS deps ──────────────────────────────
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install ninja extra-cmake-modules temurin@17 mono
+          echo "JAVA_HOME=$(/usr/libexec/java_home -v 17)" >> "$GITHUB_ENV"
+
+      - name: Setup vcpkg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> "$GITHUB_ENV"
+
+      - name: Export GitHub Actions cache variables (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install Qt (macOS)
+        if: runner.os == 'macOS'
+        uses: jurplel/install-qt-action@v4
+        with:
+          aqtversion: "==3.1.*"
+          version: ${{ matrix.qt-version }}
+          modules: qtimageformats qtnetworkauth
+          cache: false
+
+      # ── Windows deps ─────────────────────────────
+      - name: Enter VS Developer shell (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.vcvars-arch }}
+          vsversion: "2022"
+
+      - name: Setup Java (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Setup vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -Append $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Export GitHub Actions cache variables (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install Qt (Windows)
+        if: runner.os == 'Windows'
+        uses: jurplel/install-qt-action@v4
+        with:
+          aqtversion: "==3.1.*"
+          version: ${{ matrix.qt-version }}
+          arch: win64_msvc2022_64
+          modules: qtimageformats qtnetworkauth
+          cache: false
+
+      # ── Build ────────────────────────────────────
+      - name: Configure
+        working-directory: prism-src
+        run: cmake --preset "${{ matrix.cmake-preset }}"
+
+      - name: Build
+        working-directory: prism-src
+        run: cmake --build --preset "${{ matrix.cmake-preset }}" --config "$BUILD_TYPE"
+
+      # ── Package: macOS ───────────────────────────
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        working-directory: prism-src
+        run: |
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE"
+
+          cd "$INSTALL_DIR"
+          chmod +x "PrismLauncher.app/Contents/MacOS/prismlauncher"
+
+          # Ad-hoc sign (no Apple cert)
+          sudo codesign --sign "-" --deep --force \
+            --entitlements "../program_info/AdhocSignedApp.entitlements" \
+            --options runtime \
+            "PrismLauncher.app/Contents/MacOS/prismlauncher"
+
+          mv "PrismLauncher.app" "Prism Launcher.app"
+
+          # Create .zip
+          ditto -c -k --sequesterRsrc --keepParent "Prism Launcher.app" \
+            "../../PrismLauncher-macOS-${{ env.TAG }}.zip"
+
+          # Create .dmg
+          mkdir -p dmg-src
+          cp -R "Prism Launcher.app" dmg-src/
+          ln -s /Applications dmg-src/
+          hdiutil create \
+            -volname "Prism Launcher ${{ env.TAG }}" \
+            -srcfolder dmg-src \
+            -ov -format ULMO \
+            "../../PrismLauncher-macOS-${{ env.TAG }}.dmg"
+
+      # ── Package: Windows ─────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        working-directory: prism-src
+        shell: pwsh
+        run: |
+          cmake --install $env:BUILD_DIR --config $env:BUILD_TYPE
+          Compress-Archive -Path "$env:INSTALL_DIR\*" `
+            -DestinationPath "..\PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip"
+
+      # ── Package: Linux ───────────────────────────
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        working-directory: prism-src
+        run: |
+          # Cleanup Qt installation on Linux
+          rm -rf "$QT_PLUGIN_PATH"/printsupport
+          rm -rf "$QT_PLUGIN_PATH"/sqldrivers
+          rm -rf "$QT_PLUGIN_PATH"/help
+          rm -rf "$QT_PLUGIN_PATH"/designer
+          rm -rf "$QT_PLUGIN_PATH"/qmltooling
+          rm -rf "$QT_PLUGIN_PATH"/qmlls
+          rm -rf "$QT_PLUGIN_PATH"/qmllint
+          rm -rf "$QT_PLUGIN_PATH"/platformthemes/libqgtk3.so
+
+          # Fixup architecture naming for AppImages
+          dpkg_arch="$(dpkg-architecture -q DEB_HOST_ARCH_CPU)"
+          case "$dpkg_arch" in
+            "amd64")
+              APPIMAGE_ARCH="x86_64"
+              ;;
+            "arm64")
+              APPIMAGE_ARCH="aarch64"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+          # AppImage packaging
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-appdir
+
+          sharun lib4bin \
+            --hard-links \
+            --with-hooks \
+            --dst-dir install-appdir \
+            install-appdir/bin/* "$QT_PLUGIN_PATH"/*/*.so
+
+          cp ~/bin/AppImageUpdate.AppImage install-appdir/bin/
+          find install-appdir -name '*gamemode*' -exec rm {} +
+
+          echo "PRISMLAUNCHER_DISABLE_GLVULKAN=1" >> install-appdir/.env
+          echo "QT_QPA_PLATFORMTHEME=xdgdesktopportal" >> install-appdir/.env
+          ln -s org.prismlauncher.PrismLauncher.metainfo.xml install-appdir/share/metainfo/org.prismlauncher.PrismLauncher.appdata.xml
+          ln -s share/applications/org.prismlauncher.PrismLauncher.desktop install-appdir/
+          ln -s share/icons/hicolor/256x256/apps/org.prismlauncher.PrismLauncher.png install-appdir/
+          mv install-appdir/{sharun,AppRun}
+
+          mkappimage \
+            --updateinformation "gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|PrismLauncher-Linux-$APPIMAGE_ARCH.AppImage.zsync" \
+            install-appdir \
+            "../PrismLauncher-Linux-$APPIMAGE_ARCH.AppImage"
+
+          # Portable tarball packaging
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-portable
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-portable --component portable
+
+          sharun lib4bin \
+            --with-hooks \
+            --hard-links \
+            --dst-dir install-portable \
+            install-portable/bin/* "$QT_PLUGIN_PATH"/*/*.so
+
+          find install-portable -name '*gamemode*' -exec rm {} +
+
+          for l in $(find install-portable -type f -o -type l); do
+            l=${l#$(pwd)/}
+            l=${l#install-portable/}
+            l=${l#./}
+            echo "$l"
+          done > install-portable/manifest.txt
+
+          cd install-portable
+          tar -czf ../../PrismLauncher-Linux-Portable-$APPIMAGE_ARCH.tar.gz *
+
+      # ── Upload artifacts ─────────────────────────
+      - name: Upload macOS artifacts
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ env.TAG }}
+          path: |
+            PrismLauncher-macOS-${{ env.TAG }}.zip
+            PrismLauncher-macOS-${{ env.TAG }}.dmg
+
+      - name: Upload Windows artifacts
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ env.TAG }}
+          path: PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip
+
+      - name: Upload Linux artifacts
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ env.TAG }}
+          path: |
+            PrismLauncher-Linux-*.AppImage
+            PrismLauncher-Linux-*.AppImage.zsync
+            PrismLauncher-Linux-Portable-*.tar.gz
+
+  # ─────────────────────────────────────────────
+  # 3. Create GitHub Release with all artifacts
+  # ─────────────────────────────────────────────
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build combined patch file
+        run: cat patches/*.patch > "offline-patches-${TAG}.patch"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "PrismLauncher ${{ env.TAG }} (Offline Patched)"
+          overwrite_files: true
+          body: |
+            Auto-patched from [PrismLauncher ${{ env.TAG }}](https://github.com/PrismLauncher/PrismLauncher/releases/tag/${{ env.TAG }}).
+
+            ### What's changed (3 patches)
+            | File | Change |
+            |------|--------|
+            | `launcher/minecraft/auth/MinecraftAccount.h` | `ownsMinecraft()` always returns `true` |
+            | `launcher/minecraft/auth/AccountList.cpp` | `anyAccountIsValid()` always returns `true` |
+            | `launcher/LaunchController.cpp` | `decideLaunchMode()` bypasses auth gating while preserving explicit offline/demo launches |
+
+            ### Downloads
+            | File | Platform |
+            |------|----------|
+            | `PrismLauncher-macOS-*.dmg` | macOS (Universal, ad-hoc signed) |
+            | `PrismLauncher-macOS-*.zip` | macOS (app bundle zip) |
+            | `PrismLauncher-Windows-MSVC-*.zip` | Windows x64 |
+            | `PrismLauncher-Linux-*.AppImage` | Linux AppImage (x86_64) |
+            | `PrismLauncher-Linux-*.AppImage.zsync` | AppImage Zsync (x86_64) |
+            | `PrismLauncher-Linux-Portable-*.tar.gz` | Linux Portable (x86_64) |
+            | `offline-patches-*.patch` | Unified diff — apply with `git apply` |
+          files: |
+            artifacts/PrismLauncher-macOS-${{ env.TAG }}.dmg
+            artifacts/PrismLauncher-macOS-${{ env.TAG }}.zip
+            artifacts/PrismLauncher-Windows-MSVC-${{ env.TAG }}.zip
+            artifacts/PrismLauncher-Linux-*.AppImage
+            artifacts/PrismLauncher-Linux-*.AppImage.zsync
+            artifacts/PrismLauncher-Linux-Portable-*.tar.gz
+            offline-patches-${{ env.TAG }}.patch
