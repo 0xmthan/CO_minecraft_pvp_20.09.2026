@@ -1,0 +1,249 @@
+name: Check & Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Force upstream tag (e.g. 10.0.5). Leave empty to auto-detect."
+        required: false
+      force_rebuild:
+        description: "Force build even if a release for this tag already exists. Useful after patch-only fixes."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Detect whether a new upstream version exists
+  # ─────────────────────────────────────────────
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      skip: ${{ steps.check.outputs.skip }}
+
+    steps:
+      - name: Get latest upstream tag
+        id: upstream
+        run: |
+          if [ -n "${{ github.event.inputs.force_version }}" ]; then
+            TAG="${{ github.event.inputs.force_version }}"
+          else
+            TAG=$(curl -sf "https://api.github.com/repos/PrismLauncher/PrismLauncher/releases/latest" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              | jq -r '.tag_name')
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $TAG"
+
+      - name: Check if already released
+        id: check
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          FORCE_REBUILD="${{ github.event.inputs.force_rebuild }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}")
+
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Force rebuild requested for $TAG, proceeding even if release already exists."
+          elif [ "$STATUS" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists, skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New version $TAG, proceeding with build."
+          fi
+
+  # ─────────────────────────────────────────────
+  # 2. Build patched AppImage (Linux x86_64)
+  # ─────────────────────────────────────────────
+  build:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-24.04
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      BUILD_DIR: build
+      INSTALL_DIR: install
+      BUILD_TYPE: Release
+      QT_VERSION: "6.10.2"
+      APPIMAGE_ARCH: x86_64
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+        with:
+          path: patcher
+
+      - name: Clone Prism Launcher at upstream tag
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch "$TAG" \
+            https://github.com/PrismLauncher/PrismLauncher.git prism-src
+          echo "Cloned @ $TAG"
+
+      - name: Apply offline patches
+        run: |
+          cd prism-src
+          git apply --whitespace=nowarn ../patcher/patches/0001-ownsMinecraft-always-true.patch
+          git apply --whitespace=nowarn ../patcher/patches/0002-anyAccountIsValid-always-true.patch
+          git apply --whitespace=nowarn ../patcher/patches/0003-decideLaunchMode-skip-auth.patch
+          git apply --whitespace=nowarn ../patcher/patches/0004-download-missing-libraries-offline.patch
+          echo "All patches applied."
+
+      # ── Dependencies ────────────────────────────
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install \
+            ninja-build extra-cmake-modules pkg-config scdoc \
+            cmark gamemode-dev libarchive-dev libcmark-dev libqrencode-dev zlib1g-dev \
+            libxcb-cursor-dev libtomlplusplus-dev
+
+      - name: Setup AppImage tooling
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/bin
+          gh release download \
+            --repo VHSgunzo/sharun \
+            --pattern "sharun-$APPIMAGE_ARCH-aio" \
+            --output ~/bin/sharun
+
+          gh release download continuous \
+            --repo DioEgizio/go-appimage \
+            --pattern "mkappimage-*-$APPIMAGE_ARCH.AppImage" \
+            --output ~/bin/mkappimage
+
+          gh release download \
+            --repo AppImageCommunity/AppImageUpdate \
+            --pattern "AppImageUpdate-$APPIMAGE_ARCH.AppImage" \
+            --output ~/bin/AppImageUpdate.AppImage
+
+          chmod +x ~/bin/*
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          aqtversion: "==3.1.*"
+          version: ${{ env.QT_VERSION }}
+          modules: qtimageformats qtnetworkauth
+          cache: false
+
+      # ── Build ────────────────────────────────────
+      - name: Configure
+        working-directory: prism-src
+        run: cmake --preset linux
+
+      - name: Build
+        working-directory: prism-src
+        run: cmake --build --preset linux --config "$BUILD_TYPE"
+
+      # ── Package ──────────────────────────────────
+      - name: Package AppImage
+        working-directory: prism-src
+        run: |
+          # Cleanup Qt installation
+          rm -rf "$QT_PLUGIN_PATH"/printsupport
+          rm -rf "$QT_PLUGIN_PATH"/sqldrivers
+          rm -rf "$QT_PLUGIN_PATH"/help
+          rm -rf "$QT_PLUGIN_PATH"/designer
+          rm -rf "$QT_PLUGIN_PATH"/qmltooling
+          rm -rf "$QT_PLUGIN_PATH"/qmlls
+          rm -rf "$QT_PLUGIN_PATH"/qmllint
+          rm -rf "$QT_PLUGIN_PATH"/platformthemes/libqgtk3.so
+
+          cmake --install "$BUILD_DIR" --config "$BUILD_TYPE" --prefix install-appdir
+
+          sharun lib4bin \
+            --hard-links \
+            --with-hooks \
+            --dst-dir install-appdir \
+            install-appdir/bin/* "$QT_PLUGIN_PATH"/*/*.so
+
+          cp ~/bin/AppImageUpdate.AppImage install-appdir/bin/
+          find install-appdir -name '*gamemode*' -exec rm {} +
+
+          echo "PRISMLAUNCHER_DISABLE_GLVULKAN=1" >> install-appdir/.env
+          echo "QT_QPA_PLATFORMTHEME=xdgdesktopportal" >> install-appdir/.env
+          ln -s org.prismlauncher.PrismLauncher.metainfo.xml install-appdir/share/metainfo/org.prismlauncher.PrismLauncher.appdata.xml
+          ln -s share/applications/org.prismlauncher.PrismLauncher.desktop install-appdir/
+          ln -s share/icons/hicolor/256x256/apps/org.prismlauncher.PrismLauncher.png install-appdir/
+          mv install-appdir/{sharun,AppRun}
+
+          mkappimage \
+            --updateinformation "gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|PrismLauncher-Linux-$APPIMAGE_ARCH.AppImage.zsync" \
+            install-appdir \
+            "../PrismLauncher-Linux-$APPIMAGE_ARCH.AppImage"
+
+      # ── Upload artifacts ─────────────────────────
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ env.TAG }}
+          path: |
+            PrismLauncher-Linux-*.AppImage
+            PrismLauncher-Linux-*.AppImage.zsync
+
+  # ─────────────────────────────────────────────
+  # 3. Create GitHub Release with the artifacts
+  # ─────────────────────────────────────────────
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+
+    steps:
+      - name: Checkout patcher repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build combined patch file
+        run: cat patches/*.patch > "offline-patches-${TAG}.patch"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "PrismLauncher ${{ env.TAG }} (Offline Patched)"
+          overwrite_files: true
+          body: |
+            Auto-patched from [PrismLauncher ${{ env.TAG }}](https://github.com/PrismLauncher/PrismLauncher/releases/tag/${{ env.TAG }}).
+
+            ### What's changed (3 patches)
+            | File | Change |
+            |------|--------|
+            | `launcher/minecraft/auth/MinecraftAccount.h` | `ownsMinecraft()` always returns `true` |
+            | `launcher/minecraft/auth/AccountList.cpp` | `anyAccountIsValid()` always returns `true` |
+            | `launcher/LaunchController.cpp` | `decideLaunchMode()` bypasses auth gating while preserving explicit offline/demo launches |
+
+            ### Downloads
+            | File | Platform |
+            |------|----------|
+            | `PrismLauncher-Linux-*.AppImage` | Linux AppImage (x86_64) |
+            | `PrismLauncher-Linux-*.AppImage.zsync` | AppImage Zsync (x86_64) |
+            | `offline-patches-*.patch` | Unified diff — apply with `git apply` |
+          files: |
+            artifacts/PrismLauncher-Linux-*.AppImage
+            artifacts/PrismLauncher-Linux-*.AppImage.zsync
+            offline-patches-${{ env.TAG }}.patch

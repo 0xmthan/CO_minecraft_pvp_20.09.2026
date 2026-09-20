@@ -1,0 +1,15 @@
+# Never commit credentials
+.env
+
+# The server, its plugins and their build scripts live in their own repo now.
+# Kept here on disk so an existing checkout keeps working, but untracked.
+server/
+server.sh
+coalition_plugin/
+partygames/
+
+# Tournament archives
+tournament-data/
+
+# Local build tooling
+.tools/
